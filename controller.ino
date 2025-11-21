@@ -9,7 +9,7 @@ const char* ssid = "Wokwi-GUEST"; //conexão gratuita disponibilizada pela wokwi
 const char* password = "";
 
 // MQTT Broker settings
-const char* mqtt_server = "broker.hivemq.com";  // Broker gratuito
+const char* mqtt_server = "test.mosquitto.org";  // Broker gratuito
 const int mqtt_port = 1883;
 const char* mqtt_user = "";     
 const char* mqtt_password = ""; 
@@ -47,11 +47,18 @@ const unsigned long PUBLISH_INTERVAL = 5000;
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
+// Variáveis para medição de tempo de resposta
+struct ResponseMetrics {
+  unsigned long sensorReadTime;
+  unsigned long ledResponseTime;
+  unsigned long mqttResponseTime;
+} metrics;
+
 void setup() {
   Serial.begin(115200);
   Serial.println("Iniciando o leitor de qualidade do ar...");
   
-  // Setup PWM channels for RGB LED (NEW METHOD)
+  // Setup PWM channels for RGB LED
   setupLED();
   
   // Setup MQ2 sensor
@@ -86,8 +93,11 @@ void loop() {
   mqttClient.loop();
   
   // Read sensor values
+  unsigned long t1 = micros();
   int digitalValue = digitalRead(MQ2_DIGITAL_PIN);
   int analogValue = analogRead(MQ2_ANALOG_PIN);
+  metrics.sensorReadTime = micros() - t1;
+
   bool smokeDetected = (analogValue > smokeThreshold);
   
   // Display readings
@@ -99,6 +109,7 @@ void loop() {
   
   // Control LED if not in manual mode
   if (!manualLEDControl) {
+    unsigned long t2 = micros();
     if (!smokeDetected) {
       Serial.println("QUALIDADE BOA");
       setColor(0, 255, 0);  // Green
@@ -106,21 +117,27 @@ void loop() {
       Serial.println("QUALIDADE RUIM");
       setColor(255, 0, 0);  // Red
     }
+     metrics.ledResponseTime = micros() - t2;
   } else {
     Serial.println(smokeDetected ? "SMOKE DETECTED! (Manual LED)" : "SAFE (Manual LED)");
   }
   
-  // Publish sensor data at regular intervals
+  // Publicação periódicoa
   if (millis() - lastPublishTime > PUBLISH_INTERVAL) {
     publishSensorData(analogValue, digitalValue, smokeDetected);
     lastPublishTime = millis();
   }
   
-  // Send alert if smoke state changed
+  // Gera alerta se há mudança de estado
   if (smokeDetected != lastSmokeState) {
+    unsigned long t3 = micros();
+
     if (smokeDetected) {
       publishSmokeAlert(analogValue);
     }
+
+    metrics.mqttResponseTime = micros() - t3;
+
     publishStatusUpdate(smokeDetected);
     lastSmokeState = smokeDetected;
   }
@@ -211,6 +228,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 void handleLEDControl(String message) {
+  unsigned long cmdStart = micros();
+
   StaticJsonDocument<200> doc;
   DeserializationError error = deserializeJson(doc, message);
   
@@ -226,10 +245,23 @@ void handleLEDControl(String message) {
     int blue = doc["blue"] | 0;
     
     setColor(red, green, blue);
+
+    unsigned long cmdLatency = micros() - cmdStart;
+
     Serial.println("LED em modo manual");
+
+    StaticJsonDocument<150> ack;
+    ack["device_id"] = device_id;
+    ack["timestamp"] = millis();
+    ack["command_latency_ms"] = cmdLatency / 1000.0;
+    
+    String jsonAck;
+    serializeJson(ack, jsonAck);
+    mqttClient.publish("smokeDetector/led/ack", jsonAck.c_str());
+
   } else {
     manualLEDControl = false;
-    Serial.println("LED em modo automátocp");
+    Serial.println("LED em modo automátoco");
   }
 }
 
@@ -278,6 +310,11 @@ void publishSmokeAlert(int smokeLevel) {
   doc["smoke_level"] = smokeLevel;
   doc["threshold"] = smokeThreshold;
   doc["location"] = "Your Location";
+
+  JsonObject response = doc.createNestedObject("response_times_ms");
+  response["sensor_read"] = metrics.sensorReadTime / 1000.0;
+  response["led_response"] = metrics.ledResponseTime / 1000.0;
+  response["mqtt_publish"] = metrics.mqttResponseTime / 1000.0;
   
   String jsonString;
   serializeJson(doc, jsonString);
